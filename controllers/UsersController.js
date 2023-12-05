@@ -1,50 +1,70 @@
-const crypto = require('crypto');
-const dbClient = require('../utils/db');
-const redisclient = require('../utils/redis');
+import sha1 from 'sha1';
+import Queue from 'bull';
+import { findUserById, findUserIdByToken } from '../utils/helpers';
+import dbClient from '../utils/db';
+
+const userQueue = new Queue('userQueue');
 
 class UsersController {
-  constructor() {
-    this.db = dbClient;
-    this.redis = redisclient;
+  /**
+   * Creates a user using email and password
+   */
+  static async postNew(request, response) {
+    const { email, password } = request.body;
+
+    // check for email and password
+    if (!email) return response.status(400).send({ error: 'Missing email' });
+    if (!password) return response.status(400).send({ error: 'Missing password' });
+
+    // check if the email already exists in DB
+    const emailExists = await dbClient.users.findOne({ email });
+    if (emailExists) return response.status(400).send({ error: 'Already exist' });
+
+    // Insert new user
+    const sha1Password = sha1(password);
+    let result;
+    try {
+      result = await dbClient.users.insertOne({
+        email, password: sha1Password,
+      });
+    } catch (err) {
+      await userQueue.add({});
+      return response.status(500).send({ error: 'Error creating user' });
+    }
+
+    const user = {
+      id: result.insertedId,
+      email,
+    };
+
+    await userQueue.add({
+      userId: result.insertedId.toString(),
+    });
+
+    return response.status(201).send(user);
   }
 
-  async postNew(User) {
-    const user = User;
-    if (!user || Object.keys(user).length === 0) {
-      throw new Error('Internal error');
-    }
-    const email = { email: user.email };
-    const users = await this.db.findUser(email);
-    if (users.length > 0) {
-      throw new Error('Already exist');
-    } else {
-      user.password = crypto.createHash('sha1').update(user.password).digest('hex');
-      const insertResult = await this.db.uploadUser(user);
-      const id = insertResult.insertedId.toString();
-      return {
-        id,
-        email: user.email,
-      };
-    }
-  }
+  /**
+   * Should retrieve the user base on the token used
+   */
+  static async getMe(request, response) {
+    const token = request.headers['x-token'];
+    if (!token) { return response.status(401).json({ error: 'Unauthorized' }); }
 
-  async getMe(token) {
-    if (!token) {
-      throw new Error('Internal error');
-    }
-    const userId = await this.redis.get(`auth_${token}`);
-    if (userId) {
-      const user = await this.db.findUser({ _id: userId });
-      if (Object.keys(user).length > 0) {
-        return {
-          id: user.id,
-          email: user.email,
-        };
-      }
-    }
-    throw new Error('Unauthorized');
+    // Retrieve the user based on the token
+    const userId = await findUserIdByToken(request);
+    if (!userId) return response.status(401).send({ error: 'Unauthorized' });
+
+    const user = await findUserById(userId);
+
+    if (!user) return response.status(401).send({ error: 'Unauthorized' });
+
+    const processedUser = { id: user._id, ...user };
+    delete processedUser._id;
+    delete processedUser.password;
+    // Return the user object (email and id only)
+    return response.status(200).send(processedUser);
   }
 }
 
-const userscontroller = new UsersController();
-module.exports = userscontroller;
+module.exports = UsersController;
